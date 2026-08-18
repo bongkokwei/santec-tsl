@@ -1,0 +1,9 @@
+pyvisa
+numpy
+
+[dev]
+pytest
+pytest-mock
+
+[gui]
+PyQt6

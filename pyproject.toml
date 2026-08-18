@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "santec-tsl"
+version = "0.1.0"
+description = "Python driver and PyQt6 control panel for the santec TSL-570 tunable laser"
+requires-python = ">=3.11"
+dependencies = [
+    "pyvisa",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-mock"]
+gui = ["PyQt6"]
+
+[project.scripts]
+santec-tsl-gui = "santec_tsl.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-v"
+markers = [
+    "hw: requires a physical TSL-570 reachable over VISA",
+]
