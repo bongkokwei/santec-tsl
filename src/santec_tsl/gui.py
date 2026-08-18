@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -40,6 +41,11 @@ from .worker import Capabilities, LaserWorker, SweepSettings, Telemetry
 log = logging.getLogger(__name__)
 
 POLL_INTERVALS = [("0.5 s", 500), ("1 s", 1000), ("2 s", 2000), ("5 s", 5000)]
+
+#: Trailing entry in the resource dropdown. LAN sockets are never enumerated by
+#: ``list_resources()``, so there has to be a way to type one in.
+MANUAL_ENTRY = "Enter an address..."
+EXAMPLE_SOCKET = "TCPIP0::192.168.1.161::5000::SOCKET"
 
 SWEEP_MODE_LABELS = [
     ("Step, one way", SweepMode.STEP_ONE_WAY),
@@ -147,7 +153,8 @@ QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
     background: #f2f4f7;
     color: #a6aebb;
 }
-QComboBox::drop-down { border: none; width: 18px; }
+/* Left unstyled on purpose: any rule here replaces the native arrow with a
+   blank subcontrol, and the panel ships no image assets to put back. */
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 16px;
@@ -250,6 +257,7 @@ class MainWindow(QMainWindow):
         self.output_on = False
         self.sweeping = False
         self.busy = False
+        self._manual_resources: list[str] = []
 
         log.info("Opening the control panel")
         self._build_ui()
@@ -305,8 +313,8 @@ class MainWindow(QMainWindow):
         row.addWidget(label)
 
         self.resource_combo = QComboBox()
-        self.resource_combo.setEditable(True)
         self.resource_combo.setMinimumWidth(340)
+        self.resource_combo.activated.connect(self._on_resource_activated)
         row.addWidget(self.resource_combo, 1)
 
         self.rescan_button = QPushButton("Rescan")
@@ -573,34 +581,74 @@ class MainWindow(QMainWindow):
     # -- actions -----------------------------------------------------------
 
     def refresh_resources(self) -> None:
-        current = self.resource_combo.currentText()
-        self.resource_combo.clear()
+        """Repopulate the dropdown, keeping any hand-typed addresses."""
+        previous = self.selected_resource()
         try:
             resources = sorted(pyvisa.ResourceManager().list_resources())
         except (pyvisa.VisaIOError, OSError, ValueError) as exc:
             log.warning("Could not enumerate VISA resources: %s", exc)
             self.status_message.setText(f"VISA scan failed: {exc}")
             resources = []
-        self.resource_combo.addItems(resources)
-        if current:
-            self.resource_combo.setCurrentText(current)
+
+        self.resource_combo.blockSignals(True)
+        self.resource_combo.clear()
+        for resource in resources:
+            self.resource_combo.addItem(resource, resource)
+        for resource in self._manual_resources:
+            if resource not in resources:
+                self.resource_combo.addItem(resource, resource)
+        self.resource_combo.addItem(MANUAL_ENTRY, None)
+        index = self.resource_combo.findData(previous) if previous else -1
+        self.resource_combo.setCurrentIndex(max(index, 0))
+        self.resource_combo.blockSignals(False)
+
         log.info("VISA scan found %d resource(s)", len(resources))
         if resources:
             self.status_message.setText(f"{len(resources)} VISA resource(s) found")
-        elif not current:
-            # Nothing enumerable: LAN sockets never show up in list_resources().
-            self.resource_combo.setCurrentText("TCPIP0::192.168.1.161::5000::SOCKET")
-            self.status_message.setText("No VISA resources found - type a LAN socket address")
+        else:
+            self.status_message.setText(
+                f"No VISA resources found - pick '{MANUAL_ENTRY}' to type an address"
+            )
+
+    def selected_resource(self) -> str | None:
+        """The chosen resource string, or ``None`` on the manual-entry row."""
+        return self.resource_combo.currentData()
+
+    def _on_resource_activated(self, index: int) -> None:
+        """Prompt for an address when the manual-entry row is picked."""
+        if self.resource_combo.itemData(index) is not None:
+            return
+        text, accepted = QInputDialog.getText(
+            self,
+            "VISA resource",
+            "Address (a LAN socket, or any VISA resource string):",
+            text=EXAMPLE_SOCKET,
+        )
+        resource = text.strip()
+        if not accepted or not resource:
+            # Fall back to the first real entry rather than leaving the row selected.
+            self.resource_combo.setCurrentIndex(0 if self.resource_combo.count() > 1 else -1)
+            return
+        log.info("Resource %s entered by hand", resource)
+        if resource not in self._manual_resources:
+            self._manual_resources.append(resource)
+        existing = self.resource_combo.findData(resource)
+        if existing < 0:
+            existing = self.resource_combo.count() - 1  # just above the manual row
+            self.resource_combo.insertItem(existing, resource, resource)
+        self.resource_combo.setCurrentIndex(existing)
 
     def toggle_connection(self) -> None:
         if self.connected:
             log.info("Disconnect requested")
             self.request_close.emit()
             return
-        resource = self.resource_combo.currentText().strip()
+        resource = self.selected_resource()
         if not resource:
             log.warning("Connect requested with no resource selected")
-            QMessageBox.warning(self, "No resource", "Select or type a VISA resource first.")
+            QMessageBox.warning(
+                self, "No resource", "Choose a VISA resource from the list first."
+            )
             return
         log.info("Connect requested for %s", resource)
         self.connection_pill.set_state("Connecting...", "warn")
