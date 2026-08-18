@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 
 import pyvisa
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -175,6 +176,45 @@ QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     background: transparent;
 }
 QCheckBox { spacing: 8px; }
+
+QTabWidget::pane {
+    background: #ffffff;
+    border: 1px solid #dbe1ea;
+    border-radius: 8px;
+    top: -1px;
+}
+QTabBar::tab {
+    background: #eef1f5;
+    border: 1px solid #dbe1ea;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 7px 16px;
+    margin-right: 4px;
+    color: #6b7686;
+}
+QTabBar::tab:selected { background: #ffffff; color: #1e2532; font-weight: 600; }
+QTabBar::tab:disabled { color: #a6aebb; }
+
+/* The front-panel-style wavelength dial. Dark, so the lit digit reads as the
+   cursor the way it does on the instrument's own touchscreen. */
+QFrame#dial { background: #12161d; border: 1px solid #2a3240; border-radius: 8px; }
+QFrame#dial:focus { border-color: #2563eb; }
+QLabel#dialDigit {
+    color: #e8edf5;
+    font-family: "DejaVu Sans Mono", "Consolas", "Courier New", monospace;
+    font-size: 46px;
+    font-weight: 600;
+    padding: 6px 1px;
+}
+/* The selected place, drawn inverted. Repolished on every move -- Qt only
+   re-evaluates a property selector when the widget's style is refreshed. */
+QLabel#dialDigit[selected="true"] { background: #e8edf5; color: #12161d; border-radius: 4px; }
+QLabel#dialDigit[stale="true"] { color: #59637a; }
+QLabel#dialUnit { color: #8b95a5; font-size: 16px; }
+QLabel#dialRange { color: #8b95a5; font-size: 12px; }
+QLabel#dialHint { color: #59637a; font-size: 11px; }
+
 QStatusBar { background: #eef1f5; color: #6b7686; }
 QStatusBar::item { border: none; }
 """
@@ -241,6 +281,214 @@ class StatusPill(QFrame):
             f"QFrame#pill {{ background: {background}; border: 1px solid {background}; }}"
             f"QLabel#pillText {{ color: {foreground}; }}"
         )
+
+
+class WavelengthDial(QFrame):
+    """A front-panel-style wavelength readout you tune one decimal place at a time.
+
+    The instrument's own touchscreen puts a cursor on a single digit and steps
+    that place; this is the same idea with a mouse. Left/right moves the cursor,
+    the wheel (or up/down) steps the selected place by one, and every change is
+    sent straight to the laser -- there is no Apply button by design.
+    """
+
+    value_changed = pyqtSignal(float)
+
+    #: Power of ten each column carries. ``None`` is the decimal point, which
+    #: is drawn but never selectable.
+    PLACES = (3, 2, 1, 0, None, -1, -2, -3, -4)
+    DEFAULT_INDEX = 6  # the 0.01 nm column
+
+    #: Commands are coalesced to this rate, so spinning the wheel hard leaves
+    #: one queued write rather than fifty.
+    SEND_INTERVAL_MS = 150
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("dial")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._value = 1550.0
+        self._low = 1480.0
+        self._high = 1640.0
+        self._index = self.DEFAULT_INDEX
+        self._live = False
+        self._pending: float | None = None
+
+        self._send_timer = QTimer(self)
+        self._send_timer.setSingleShot(True)
+        self._send_timer.setInterval(self.SEND_INTERVAL_MS)
+        self._send_timer.timeout.connect(self._flush)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 12, 16, 10)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        self.range_label = QLabel("")
+        self.range_label.setObjectName("dialRange")
+        top.addWidget(self.range_label)
+        top.addStretch()
+        unit = QLabel("nm")
+        unit.setObjectName("dialUnit")
+        top.addWidget(unit)
+        outer.addLayout(top)
+
+        row = QHBoxLayout()
+        row.setSpacing(0)
+        row.addStretch()
+        self._digits: list[QLabel] = []
+        for place in self.PLACES:
+            label = QLabel(".")
+            label.setObjectName("dialDigit")
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if place is not None:
+                label.setMinimumWidth(34)
+            self._digits.append(label)
+            row.addWidget(label)
+        row.addStretch()
+        outer.addLayout(row)
+
+        hint = QLabel(
+            "\u2190 \u2192 pick the digit   \u00b7   wheel or \u2191 \u2193 to tune   "
+            "\u00b7   sent to the laser as you go"
+        )
+        hint.setObjectName("dialHint")
+        hint.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        outer.addWidget(hint)
+
+        self.setEnabled(False)
+        self.set_limits(self._low, self._high)
+        self._redraw()
+
+    # -- state -------------------------------------------------------------
+
+    def set_limits(self, low: float, high: float) -> None:
+        self._low, self._high = low, high
+        self.range_label.setText(f"{low:.4f} To {high:.4f}")
+        self.set_value(self._value)
+
+    def set_live(self, live: bool) -> None:
+        """Grey the digits out while there is nothing to tune."""
+        if self._live == live:
+            return
+        self._live = live
+        self.setEnabled(live)
+        self._redraw()
+
+    def set_value(self, value: float) -> None:
+        """Set the displayed value without emitting -- used for telemetry."""
+        self._value = min(max(value, self._low), self._high)
+        self._redraw()
+
+    def sync_value(self, value: float | None) -> None:
+        """Mirror the instrument, unless the user is the one driving."""
+        if value is None or self.hasFocus() or self._send_timer.isActive():
+            return
+        self.set_value(value)
+
+    def value(self) -> float:
+        return self._value
+
+    # -- editing -----------------------------------------------------------
+
+    def select_index(self, index: int) -> None:
+        if 0 <= index < len(self.PLACES) and self.PLACES[index] is not None:
+            self._index = index
+            self._redraw()
+
+    def move_cursor(self, delta: int) -> None:
+        index = self._index + delta
+        while 0 <= index < len(self.PLACES) and self.PLACES[index] is None:
+            index += delta  # step over the decimal point
+        self.select_index(index)
+
+    def step(self, direction: int) -> None:
+        """Add or subtract one unit of the selected place."""
+        if not self._live or direction == 0:
+            return
+        place = self.PLACES[self._index]
+        stepped = round(self._value + direction * 10.0**place, 4)
+        clamped = min(max(stepped, self._low), self._high)
+        if clamped == self._value:
+            return
+        self._value = clamped
+        self._redraw()
+        self._queue(clamped)
+
+    def _queue(self, value: float) -> None:
+        """Send now if the line is quiet, otherwise fold into the next tick."""
+        if self._send_timer.isActive():
+            self._pending = value
+            return
+        self.value_changed.emit(value)
+        self._send_timer.start()
+
+    def _flush(self) -> None:
+        if self._pending is None:
+            return
+        value, self._pending = self._pending, None
+        self.value_changed.emit(value)
+        self._send_timer.start()
+
+    # -- events ------------------------------------------------------------
+
+    def wheelEvent(self, event) -> None:
+        notches = event.angleDelta().y()
+        if notches:
+            self.step(1 if notches > 0 else -1)
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key.Key_Left:
+            self.move_cursor(-1)
+        elif key == Qt.Key.Key_Right:
+            self.move_cursor(1)
+        elif key == Qt.Key.Key_Up:
+            self.step(1)
+        elif key == Qt.Key.Key_Down:
+            self.step(-1)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        hit = self.childAt(event.position().toPoint())
+        if hit in self._digits:
+            self.select_index(self._digits.index(hit))
+        event.accept()
+
+    def focusInEvent(self, event) -> None:
+        super().focusInEvent(event)
+        self._redraw()
+
+    def focusOutEvent(self, event) -> None:
+        super().focusOutEvent(event)
+        self._redraw()
+
+    # -- painting ----------------------------------------------------------
+
+    def _redraw(self) -> None:
+        # Nine columns wide, so 1554.0000 lines up with 999.9999 and 1640.0000.
+        text = f"{self._value:9.4f}" if self._live else "    --.----"[-9:]
+        for i, label in enumerate(self._digits):
+            label.setText(text[i])
+            self._set_flag(label, "selected", self._live and i == self._index)
+            self._set_flag(label, "stale", not self._live)
+
+    @staticmethod
+    def _set_flag(label: QLabel, name: str, on: bool) -> None:
+        value = "true" if on else "false"
+        if label.property(name) == value:
+            return
+        label.setProperty(name, value)
+        label.style().unpolish(label)
+        label.style().polish(label)
 
 
 class MainWindow(QMainWindow):
@@ -344,7 +592,30 @@ class MainWindow(QMainWindow):
 
     def _build_control_group(self) -> QGroupBox:
         group = QGroupBox("OUTPUT CONTROL")
-        layout = QGridLayout(group)
+        outer = QVBoxLayout(group)
+        outer.setContentsMargins(0, 6, 0, 0)
+
+        self.control_tabs = QTabWidget()
+        self.control_tabs.addTab(self._build_setpoint_tab(), "Set values")
+        self.control_tabs.addTab(self._build_tune_tab(), "Tune wavelength")
+        outer.addWidget(self.control_tabs)
+        return group
+
+    def _build_tune_tab(self) -> QWidget:
+        """Digit-at-a-time wavelength tuning, after the instrument's own panel."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        self.wavelength_dial = WavelengthDial()
+        self.wavelength_dial.value_changed.connect(self.request_wavelength)
+        layout.addWidget(self.wavelength_dial)
+        layout.addStretch()
+        return page
+
+    def _build_setpoint_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QGridLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
         layout.setHorizontalSpacing(12)
         layout.setVerticalSpacing(10)
         layout.setColumnStretch(1, 1)
@@ -368,7 +639,8 @@ class MainWindow(QMainWindow):
 
         self.limits_label = QLabel("")
         self.limits_label.setObjectName("fieldLabel")
-        layout.addWidget(self.limits_label, 4, 1)
+        # Spans both columns: the line is long, and the tab inset costs width.
+        layout.addWidget(self.limits_label, 4, 0, 1, 2)
 
         toggles = QHBoxLayout()
         toggles.setSpacing(14)
@@ -394,7 +666,7 @@ class MainWindow(QMainWindow):
         self.shutter_button.clicked.connect(self.toggle_shutter)
         layout.addWidget(self.shutter_button, 7, 0, 1, 2)
         layout.setRowStretch(8, 1)
-        return group
+        return page
 
     def _add_apply_row(
         self, layout, row, label_text, low, high, decimals, step, on_apply
@@ -717,6 +989,9 @@ class MainWindow(QMainWindow):
 
         for spin in (self.wavelength_spin, self.sweep_start_spin, self.sweep_stop_spin):
             spin.setRange(caps.min_wavelength_nm, caps.max_wavelength_nm)
+        self.wavelength_dial.set_limits(
+            caps.min_wavelength_nm, caps.max_wavelength_nm
+        )
         self.power_spin.setRange(caps.min_power_dbm, caps.max_power_dbm)
         self.limits_label.setText(
             f"Allowed {caps.min_wavelength_nm:.2f} - {caps.max_wavelength_nm:.2f} nm, "
@@ -762,6 +1037,7 @@ class MainWindow(QMainWindow):
 
         # Mirror the instrument's own state into the editors the user isn't in.
         self._sync_spin(self.wavelength_spin, data.wavelength_nm)
+        self.wavelength_dial.sync_value(data.wavelength_nm)
         self._sync_spin(self.frequency_spin, data.frequency_thz)
         self._sync_spin(self.power_spin, data.power_dbm)
         self._sync_spin(self.attenuation_spin, data.attenuation_db)
@@ -862,6 +1138,7 @@ class MainWindow(QMainWindow):
             self.sweep_stop_button,
         ):
             widget.setEnabled(live)
+        self.wavelength_dial.set_live(live)
         self.connect_button.setEnabled(not self.busy)
         self.resource_combo.setEnabled(not self.connected and not self.busy)
         self.rescan_button.setEnabled(not self.connected and not self.busy)
