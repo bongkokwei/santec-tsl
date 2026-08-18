@@ -132,10 +132,22 @@ class TSL570:
             self._rm = None
             raise TSLConnectionError(f"Could not open {self.resource!r}: {exc}") from exc
 
-        # The delimiter is CR on LAN, USB and (by default) GPIB — manual 7.2/7.3.
         self._inst.timeout = int(self.timeout * 1000)
+        # Commands end with CR; the instrument accepts CR as a delimiter and VISA
+        # asserts EOI on the last byte anyway (manual 7.1.3).
         self._inst.write_termination = "\r"
-        self._inst.read_termination = "\r"
+        # Replies are another matter. On GPIB/USB the instrument asserts EOI at
+        # the end of a reply *and* appends its configured delimiter, which may be
+        # CR+LF — stopping at the CR would leave the LF behind and shift every
+        # later reply by one. Read to EOI instead and strip the delimiter here.
+        # A raw TCP socket has no EOI, so there the CR is all we have.
+        self._inst.read_termination = "\r" if self._is_socket else None
+
+        # Drop anything a previous session left in the buffers (GPIB DCL).
+        try:
+            self._inst.clear()
+        except (pyvisa.VisaIOError, NotImplementedError) as exc:
+            log.debug("Device clear not available on %s: %s", self.resource, exc)
 
         try:
             self.write(":SYSTem:COMMunicate:CODe 1")  # 1 = SCPI command set
@@ -167,6 +179,11 @@ class TSL570:
     def is_open(self) -> bool:
         return self._inst is not None
 
+    @property
+    def _is_socket(self) -> bool:
+        """True for raw TCP sockets, which carry no EOI to mark a reply's end."""
+        return "SOCKET" in self.resource.upper()
+
     # -- raw I/O -----------------------------------------------------------
 
     def write(self, command: str) -> None:
@@ -186,6 +203,12 @@ class TSL570:
 
     def query_float(self, command: str) -> float:
         response = self.query(command)
+        if not response:
+            raise TSLProtocolError(
+                f"{command!r} returned an empty reply. The reply stream is out of "
+                "step with the commands — usually a delimiter mismatch, or a stale "
+                "reply left in the buffer by an earlier session."
+            )
         try:
             return float(response)
         except ValueError as exc:
@@ -484,12 +507,23 @@ class TSL570:
         power array is float32 in dBm, both little-endian (manual p. 87).
         """
         inst = self._require_open()
-        wavelength_m = inst.query_binary_values(
-            ":READout:DATa?", datatype="d", is_big_endian=False, container=np.array
-        )
-        power_dbm = inst.query_binary_values(
-            ":READout:DATa:POWer?", datatype="f", is_big_endian=False, container=np.array
-        )
+        # The payload is raw binary, so a 0x0D byte inside it would look like the
+        # CR delimiter. The length header tells PyVISA how much to read, so drop
+        # the termination character for the duration of the transfer.
+        saved_termination = inst.read_termination
+        inst.read_termination = None
+        try:
+            wavelength_m = inst.query_binary_values(
+                ":READout:DATa?", datatype="d", is_big_endian=False, container=np.array
+            )
+            power_dbm = inst.query_binary_values(
+                ":READout:DATa:POWer?",
+                datatype="f",
+                is_big_endian=False,
+                container=np.array,
+            )
+        finally:
+            inst.read_termination = saved_termination
         return SweepLog(wavelength_nm=wavelength_m * 1e9, power_dbm=power_dbm)
 
     # -- triggers ----------------------------------------------------------

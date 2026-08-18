@@ -31,6 +31,16 @@ Resource strings: `TCPIP0::<ip>::<port>::SOCKET` for LAN (the port is set on the
 instrument's Communication screen), `GPIB0::<address>::INSTR` for GPIB, or
 `ASRL<n>::INSTR` for USB once santec's FTDI driver is installed.
 
+Read termination differs by transport and the driver picks it for you: GPIB and
+USB replies end with EOI *plus* whatever delimiter the front panel is set to, so
+those are read to EOI and the delimiter is stripped afterwards. Terminating on CR
+there would leave the LF of a CR+LF delimiter in the buffer and shift every later
+reply by one — which shows up as a query returning an empty string. A raw TCP
+socket has no EOI, so there the CR delimiter is used. `open()` also issues a
+device clear first, dropping any reply a crashed session left behind. If a link
+still misbehaves, `examples/probe_link.py` tries each setting and reports which
+keeps the stream in step.
+
 ### What's covered
 
 | Area | API |
