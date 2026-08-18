@@ -77,6 +77,13 @@ power; badges for output, interlock and sweep state; and a sweep section that
 mirrors whatever the instrument currently holds. Enabling the laser output asks
 for confirmation first.
 
+Output control has two tabs. **Set values** is the usual type-a-number-and-press-
+Apply grid. **Tune wavelength** is a front-panel-style readout for hunting a
+feature by hand: `\u2190` `\u2192` put the cursor on a decimal place, the mouse wheel (or
+`\u2191` `\u2193`) steps that place by one, and each step goes to the laser immediately.
+Writes are coalesced to one every 150 ms, so spinning the wheel hard does not
+flood the VISA queue.
+
 ## Tests
 
 ```bash
