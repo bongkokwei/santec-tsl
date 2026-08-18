@@ -148,13 +148,26 @@ QComboBox, QSpinBox, QDoubleSpinBox {
     padding: 6px 8px;
     min-height: 20px;
 }
+/* Keep the text clear of the drop-down chevron. */
+QComboBox { padding-right: 22px; }
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    border: 1px solid #c8d0dc;
+    border-radius: 6px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #eef2f7;
+    selection-color: #1e2532;
+}
 QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus { border-color: #2563eb; }
 QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
     background: #f2f4f7;
     color: #a6aebb;
 }
-/* Left unstyled on purpose: any rule here replaces the native arrow with a
-   blank subcontrol, and the panel ships no image assets to put back. */
+/* The drop-down button is deliberately left unstyled. Any rule here makes Qt
+   draw the subcontrol from the sheet, and with no image to put in it the arrow
+   disappears. Fusion (set in main()) draws a flat chevron that suits the panel;
+   the native Windows style would draw a themed button, which does not. */
 QSpinBox::up-button, QSpinBox::down-button,
 QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 16px;
@@ -905,6 +918,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
     app = QApplication(sys.argv)
+    # Fusion instead of the platform style: the panel is fully custom-styled,
+    # and native styles draw their own themed combo buttons and check indicators
+    # straight through the sheet. Fusion composes with it, on any OS.
+    app.setStyle("Fusion")
     app.setApplicationName("santec TSL-570 Control")
     window = MainWindow()
     window.show()
