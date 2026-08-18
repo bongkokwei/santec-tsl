@@ -1,2 +1,0 @@
-[console_scripts]
-santec-tsl-gui = santec_tsl.gui:main
